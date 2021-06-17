@@ -1,0 +1,6 @@
+markdown
+inotify
+boto3
+botocore
+zounds
+matplotlib
