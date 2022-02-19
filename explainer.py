@@ -14,9 +14,6 @@ import zounds
 import html
 import os.path
 from datetime import datetime
-from time import time
-from copy import deepcopy
-from pprint import pprint
 
 class CodeResultRenderer(ABC):
 
@@ -68,12 +65,8 @@ class CodeBlock(object):
         return '\n'.join(filter(lambda x: bool(x), self._raw.splitlines()))
 
     def get_result(self, glob: dict):
-        # print('===========================================================')
-        # print(self.normalized)
-        # start = time()
         bytecode = compile(self.normalized, 'placeholder.dat', mode='exec')
         exec(bytecode, glob)
-        # print(f'Compilation and execution took {time() - start:.2f} seconds')
         return glob.get('_', None)
 
 
@@ -231,12 +224,8 @@ def render_html(
         current_pos = 0
         preceeding = ''
 
-        keys_of_interest = set(['a'])
-        print('============================================\n\n\n')
-
         chunks = []
         for block in code_blocks:
-            print('--------------------------------------------')
             chunks.append(content[current_pos:block.start])
             chunks.append(block.markdown)
             current_pos = block.end + 1
@@ -244,16 +233,8 @@ def render_html(
             preceeding = content_key = block.content_key(preceeding)
             try:
                 g, result = result_cache[content_key]
-                print(f'Pulled {content_key} from cache')
-                print('with locals')
-                print({k: g.get(k, None) for k in keys_of_interest})
             except KeyError:
-                print(f'Computing {content_key}')
-                print('with locals')
-                print({k: g.get(k, None) for k in keys_of_interest})
-                
                 g, result = block.get_result(dict(**g))
-
                 # shallow copy of the state
                 result_cache[content_key] = dict(**g), result
             
@@ -335,5 +316,5 @@ if __name__ == '__main__':
         for event in notify.event_gen(yield_nones=False):
             (_, type_names, path, filename) = event
             if 'IN_CLOSE_WRITE' in type_names:
-                frame_cache = render_html(
+                render_html(
                     args.markdown, output_path, client, render_locator, result_cache)        
