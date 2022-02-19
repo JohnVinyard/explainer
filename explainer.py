@@ -14,7 +14,9 @@ import zounds
 import html
 import os.path
 from datetime import datetime
-
+from time import time
+from copy import deepcopy
+from pprint import pprint
 
 class CodeResultRenderer(ABC):
 
@@ -65,10 +67,14 @@ class CodeBlock(object):
     def normalized(self):
         return '\n'.join(filter(lambda x: bool(x), self._raw.splitlines()))
 
-    def get_result(self, glob: dict, loc: dict):
+    def get_result(self, glob: dict):
+        # print('===========================================================')
+        # print(self.normalized)
+        # start = time()
         bytecode = compile(self.normalized, 'placeholder.dat', mode='exec')
-        exec(bytecode, glob, loc)
-        return loc.get('_', None)
+        exec(bytecode, glob)
+        # print(f'Compilation and execution took {time() - start:.2f} seconds')
+        return glob.get('_', None)
 
 
 class EmbeddedCodeBlock(object):
@@ -82,8 +88,9 @@ class EmbeddedCodeBlock(object):
         self._span = span
         self._position = position
 
-    def get_result(self, glob: dict, loc: dict):
-        return self._block.get_result(glob, loc)
+    def get_result(self, glob: dict):
+        result = self._block.get_result(glob)
+        return glob, result
 
     @property
     def markdown(self):
@@ -101,9 +108,9 @@ class EmbeddedCodeBlock(object):
     def raw(self):
         return self._block.raw
 
-    @property
-    def content_key(self):
+    def content_key(self, preceeding=''):
         h = sha256(f'position: {self._position}'.encode())
+        h.update(preceeding.encode())
         h.update(self._block.normalized.encode())
         return h.hexdigest()
 
@@ -202,11 +209,13 @@ class AudioRenderer(CodeResultRenderer):
         return f'<audio controls src="{html.escape(url)}"></audio>'
 
 
+
 def render_html(
         markdown_path: PathLike,
         output_path: PathLike,
         s3: S3Client,
-        render_locator: RendererLocator):
+        render_locator: RendererLocator,
+        result_cache) -> dict:
 
     with open(markdown_path, 'r') as f:
         content = f.read()
@@ -219,27 +228,52 @@ def render_html(
                 return
 
         g = {}
-        l = {}
         current_pos = 0
+        preceeding = ''
+
+        keys_of_interest = set(['a'])
+        print('============================================\n\n\n')
+
         chunks = []
         for block in code_blocks:
+            print('--------------------------------------------')
             chunks.append(content[current_pos:block.start])
             chunks.append(block.markdown)
             current_pos = block.end + 1
 
-            result = block.get_result(g, l)
+            preceeding = content_key = block.content_key(preceeding)
+            try:
+                g, result = result_cache[content_key]
+                print(f'Pulled {content_key} from cache')
+                print('with locals')
+                print({k: g.get(k, None) for k in keys_of_interest})
+            except KeyError:
+                print(f'Computing {content_key}')
+                print('with locals')
+                print({k: g.get(k, None) for k in keys_of_interest})
+                
+                g, result = block.get_result(dict(**g))
+
+                # shallow copy of the state
+                result_cache[content_key] = dict(**g), result
+            
             renderer: CodeResultRenderer = render_locator.find_renderer(result)
 
             if renderer is not None:
-                print(block.content_key)
+                print(f'Rendering {content_key}')
                 bio = renderer.render(result)
-                url = s3.store_key(block.content_key, bio,
-                                   renderer.content_type)
+                url = s3.store_key(
+                    content_key, 
+                    bio,
+                    renderer.content_type)
                 html = renderer.html(url)
                 chunks.append(html)
-
+            elif result is not None:
+                print(f'Rendering code block')
+                chunks.append(f'`{result}`')
+            
             try:
-                del l['_']
+                del g['_']
             except KeyError:
                 pass
 
@@ -248,6 +282,8 @@ def render_html(
         markdown = '\n'.join(chunks)
         with open(output_path, 'w') as output_file:
             output_file.write(markdown)
+        
+        return result_cache
 
 
 if __name__ == '__main__':
@@ -287,6 +323,11 @@ if __name__ == '__main__':
         md_filename = os.path.basename(args.markdown)
         output_path = os.path.join(args.output, md_filename)
 
+    result_cache = {}
+
+    render_html(
+        args.markdown, output_path, client, render_locator, result_cache)
+
     if args.watch:
         import inotify.adapters
         notify = inotify.adapters.Inotify()
@@ -294,7 +335,5 @@ if __name__ == '__main__':
         for event in notify.event_gen(yield_nones=False):
             (_, type_names, path, filename) = event
             if 'IN_CLOSE_WRITE' in type_names:
-                print(f'rendering at f{datetime.utcnow()}')
-                render_html(args.markdown, output_path, client, render_locator)
-    else:
-        render_html(args.markdown, output_path, client, render_locator)
+                frame_cache = render_html(
+                    args.markdown, output_path, client, render_locator, result_cache)        
