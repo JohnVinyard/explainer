@@ -225,15 +225,21 @@ def render_html(
         preceeding = ''
 
         chunks = []
-        for block in code_blocks:
+        for i, block in enumerate(code_blocks):
             chunks.append(content[current_pos:block.start])
             chunks.append(block.markdown)
             current_pos = block.end + 1
 
+            # get the key of the preceeding code block
             preceeding = content_key = block.content_key(preceeding)
+
+
             try:
+                # has the result of this block already been stored in memory?
                 g, result = result_cache[content_key]
+                print(f'Pulled block {i} from cache')
             except KeyError:
+                print(f'Computing block {i}')
                 g, result = block.get_result(dict(**g))
                 # shallow copy of the state
                 result_cache[content_key] = dict(**g), result
