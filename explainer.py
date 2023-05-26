@@ -1,50 +1,8 @@
 import argparse
+import os
 from os import PathLike
+import conjure
 import re
-from hashlib import sha256
-from abc import ABC, abstractmethod, abstractproperty
-from typing import BinaryIO, Iterable, Union
-from matplotlib import pyplot as plt
-from matplotlib.artist import Artist
-from matplotlib.image import AxesImage
-import boto3
-from botocore.exceptions import ClientError
-from io import BytesIO
-import zounds
-import html
-import os.path
-from datetime import datetime
-
-class CodeResultRenderer(ABC):
-
-    @abstractproperty
-    def content_type(self):
-        pass
-
-    @abstractmethod
-    def matches(self, result: any) -> bool:
-        pass
-
-    @abstractmethod
-    def render(self, result: any) -> BinaryIO:
-        pass
-
-    @abstractmethod
-    def html(self, url: str) -> str:
-        pass
-
-
-class RendererLocator(object):
-    def __init__(self, *renderers: Iterable[CodeResultRenderer]):
-        super().__init__()
-        self._renderers = renderers
-
-    def find_renderer(self, result: any) -> Union[CodeResultRenderer, None]:
-        try:
-            return next(filter(lambda x: x.matches(result), self._renderers))
-        except StopIteration:
-            return None
-
 
 class CodeBlock(object):
 
@@ -101,12 +59,6 @@ class EmbeddedCodeBlock(object):
     def raw(self):
         return self._block.raw
 
-    def content_key(self, preceeding=''):
-        h = sha256(f'position: {self._position}'.encode())
-        h.update(preceeding.encode())
-        h.update(self._block.normalized.encode())
-        return h.hexdigest()
-
     @classmethod
     def extract_all(cls, markdown: str):
         for i, m in enumerate(cls.pattern.finditer(markdown)):
@@ -117,98 +69,12 @@ class EmbeddedCodeBlock(object):
                 position=i)
 
 
-class S3Client(object):
-
-    def __init__(self, bucket_name: str):
-        super().__init__()
-        self._bucket_name = bucket_name
-        self._client = boto3.client('s3')
-        self._create_bucket()
-
-    def _create_bucket(self):
-        try:
-            self._client.create_bucket(
-                ACL='public-read',
-                Bucket=self._bucket_name)
-            print(f'Creating bucket {self._bucket_name}')
-        except self._client.exceptions.BucketAlreadyExists:
-            pass
-
-    def key_exists(self, key: str) -> bool:
-        try:
-            self._client.head_object(
-                Bucket=self._bucket_name, Key=key)
-            return True
-        except ClientError:
-            return False
-
-    def store_key(self, key: str, data: BinaryIO, content_type: str):
-        if not self.key_exists(key):
-            print(f'Storing key {key} with content type {content_type}')
-            self._client.put_object(
-                Bucket=self._bucket_name,
-                Key=key, Body=data,
-                ACL='public-read',
-                ContentType=content_type)
-        else:
-            print(f'key {key} already stored')
-
-        return f'https://{self._bucket_name}.s3.amazonaws.com/{key}'
-
-
-class PlotRenderer(CodeResultRenderer):
-    def __init__(self, client: S3Client):
-        super().__init__()
-        self._client = client
-
-    @property
-    def content_type(self):
-        return 'image/png'
-
-    def matches(self, result: any):
-        try:
-            return isinstance(result, AxesImage) \
-                or isinstance(result[0], Artist)
-        except (IndexError, TypeError):
-            return False
-
-    def render(self, result: any):
-        bio = BytesIO()
-        plt.savefig(bio, format='png')
-        plt.clf()
-        bio.seek(0)
-        return bio
-
-    def html(self, url: str) -> str:
-        return f'<img src="{html.escape(url)}" />'
-
-
-class AudioRenderer(CodeResultRenderer):
-    def __init__(self, client: S3Client):
-        super().__init__()
-        self._client = client
-
-    @property
-    def content_type(self):
-        return 'audio/ogg'
-
-    def matches(self, result: any):
-        return isinstance(result, zounds.AudioSamples)
-
-    def render(self, result: zounds.AudioSamples):
-        return result.encode(fmt='OGG', subtype='vorbis')
-
-    def html(self, url: str) -> str:
-        return f'<audio controls src="{html.escape(url)}"></audio>'
-
-
-
 def render_html(
         markdown_path: PathLike,
         output_path: PathLike,
-        s3: S3Client,
-        render_locator: RendererLocator,
-        result_cache) -> dict:
+        storage_path: PathLike,
+        s3_bucket: str) -> dict:
+    
 
     with open(markdown_path, 'r') as f:
         content = f.read()
@@ -220,9 +86,14 @@ def render_html(
                 output_file.write(content)
                 return
 
-        g = {}
+        storage = conjure.LocalCollectionWithBackup(
+            local_path=storage_path,
+            remote_bucket=s3_bucket,
+            is_public=True)
+
+        g = { 'conjure_storage': storage }
         current_pos = 0
-        preceeding = ''
+
 
         chunks = []
         for i, block in enumerate(code_blocks):
@@ -230,35 +101,14 @@ def render_html(
             chunks.append(block.markdown)
             current_pos = block.end + 1
 
-            # get the key of the preceeding code block
-            preceeding = content_key = block.content_key(preceeding)
-
+            print(f'Computing block {i}')
+            g, result = block.get_result(dict(**g))
 
             try:
-                # has the result of this block already been stored in memory?
-                g, result = result_cache[content_key]
-                print(f'Pulled block {i} from cache')
-            except KeyError:
-                print(f'Computing block {i}')
-                g, result = block.get_result(dict(**g))
-                # shallow copy of the state
-                result_cache[content_key] = dict(**g), result
-            
-            renderer: CodeResultRenderer = render_locator.find_renderer(result)
+                chunks.append(result.conjure_html())
+            except AttributeError:
+                pass
 
-            if renderer is not None:
-                print(f'Rendering {content_key}')
-                bio = renderer.render(result)
-                url = s3.store_key(
-                    content_key, 
-                    bio,
-                    renderer.content_type)
-                html = renderer.html(url)
-                chunks.append(html)
-            elif result is not None:
-                print(f'Rendering code block')
-                chunks.append(f'`{result}`')
-            
             try:
                 del g['_']
             except KeyError:
@@ -269,12 +119,11 @@ def render_html(
         markdown = '\n'.join(chunks)
         with open(output_path, 'w') as output_file:
             output_file.write(markdown)
-        
-        return result_cache
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
+
     parser.add_argument(
         '--markdown',
         required=True,
@@ -285,6 +134,11 @@ if __name__ == '__main__':
         required=True,
         type=str,
         help='Path where the output html should be saved')
+    parser.add_argument(
+        '--storage',
+        required=True,
+        type=str,
+        help='Path where local results should be cached')
     parser.add_argument(
         '--s3',
         required=True,
@@ -298,22 +152,13 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    client = S3Client(args.s3)
-    render_locator = RendererLocator(
-        PlotRenderer(client),
-        AudioRenderer(client)
-    )
-
     if os.path.isfile(args.output):
         output_path = args.output
     else:
         md_filename = os.path.basename(args.markdown)
         output_path = os.path.join(args.output, md_filename)
 
-    result_cache = {}
-
-    render_html(
-        args.markdown, output_path, client, render_locator, result_cache)
+    render_html(args.markdown, output_path, args.storage, args.s3)
 
     if args.watch:
         import inotify.adapters
@@ -322,5 +167,4 @@ if __name__ == '__main__':
         for event in notify.event_gen(yield_nones=False):
             (_, type_names, path, filename) = event
             if 'IN_CLOSE_WRITE' in type_names:
-                render_html(
-                    args.markdown, output_path, client, render_locator, result_cache)        
+                render_html(args.markdown, output_path, args.storage, args.s3)
