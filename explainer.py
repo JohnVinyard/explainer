@@ -20,7 +20,16 @@ class CodeBlock(object):
 
     @property
     def normalized(self):
-        return '\n'.join(filter(lambda x: bool(x), self._raw.splitlines()))
+        code = '\n'.join(filter(lambda x: bool(x), self._raw.splitlines()))
+        header = '''
+import sys
+import os
+wd = os.getcwd()
+if wd not in sys.path:
+    sys.path = sys.path + [wd]
+
+'''
+        return header + code
 
     def get_result(self, glob: dict):
         bytecode = compile(self.normalized, 'placeholder.dat', mode='exec')
@@ -40,7 +49,11 @@ class EmbeddedCodeBlock(object):
         self._position = position
 
     def get_result(self, glob: dict):
-        result = self._block.get_result(glob)
+        try:
+            result = self._block.get_result(glob)
+        except Exception as e:
+            result = e
+        
         return glob, result
 
     @property
@@ -89,7 +102,8 @@ def render_html(
         storage = conjure.LocalCollectionWithBackup(
             local_path=storage_path,
             remote_bucket=s3_bucket,
-            is_public=True)
+            is_public=True,
+            cors_enabled=True)
 
         g = { 'conjure_storage': storage }
         current_pos = 0
@@ -107,7 +121,11 @@ def render_html(
             try:
                 chunks.append(result.conjure_html())
             except AttributeError:
-                pass
+                chunks.append(f'''
+```
+{result}
+```
+                ''')
 
             try:
                 del g['_']
