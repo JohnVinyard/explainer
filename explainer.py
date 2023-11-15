@@ -157,6 +157,10 @@ if __name__ == '__main__':
     else:
         md_filename = os.path.basename(args.markdown)
         output_path = os.path.join(args.output, md_filename)
+    
+    if not os.path.exists(args.markdown):
+        with open(args.markdown, 'w') as f:
+            pass
 
     render_html(args.markdown, output_path, args.storage, args.s3)
 
